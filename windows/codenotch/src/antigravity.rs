@@ -215,9 +215,12 @@ fn discover() -> Option<Endpoint> {
 #[cfg(not(windows))]
 fn discover_from_proc() -> Option<Endpoint> {
     for entry in std::fs::read_dir("/proc").ok()?.flatten() {
-        let name = entry.file_name();
-        let pid: u32 = name.to_string_lossy().parse().ok()?;
-        let cmdline = std::fs::read(entry.path().join("cmdline")).ok()?;
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
         if cmdline.is_empty() {
             continue;
         }
@@ -230,7 +233,9 @@ fn discover_from_proc() -> Option<Endpoint> {
         if !cmd.contains("language_server") || !cmd.contains("--csrf_token") {
             continue;
         }
-        let csrf = flag_value(&cmd, "--csrf_token")?;
+        let Some(csrf) = flag_value(&cmd, "--csrf_token") else {
+            continue;
+        };
         let ports = listening_ports_unix(pid);
         if ports.is_empty() {
             continue;
@@ -264,7 +269,9 @@ fn listening_ports_proc_net(pid: u32) -> Vec<u16> {
         return Vec::new();
     };
     for entry in entries.flatten() {
-        let link = std::fs::read_link(entry.path()).ok()?;
+        let Ok(link) = std::fs::read_link(entry.path()) else {
+            continue;
+        };
         let s = link.to_string_lossy();
         if let Some(rest) = s.strip_prefix("socket:[") {
             if let Some(num) = rest.strip_suffix(']') {
