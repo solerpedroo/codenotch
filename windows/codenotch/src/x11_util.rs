@@ -65,24 +65,41 @@ fn atom(conn: &x11rb::rust_connection::RustConnection, name: &[u8]) -> Option<u3
         .map(|r| r.atom)
 }
 
-/// Linux hover must not use root-pointer math. `set_ignore_cursor_events` was turning the
-/// window off while the cursor sat hundreds of pixels away from where the page drew the pill
-/// (run.log `cursor_rel=(-286,90)` with the pill at x≈290). The input shape is window-local:
-/// the edge strip plus the hot rectangles the page reports, so the webview receives motion
-/// exactly where the notch is drawn.
-#[allow(dead_code)]
-pub fn sync_input_shape(rects: &[[f64; 4]], edge: &str) {
+/// Input shape of the notch window only. Root-pointer hit tests disagreed with the pill
+/// (run.log r41: cursor at (25,181), pill at y=0) and `set_ignore_cursor_events` then
+/// swallowed the hover. These rectangles are window-local, same space as the page's hot rects.
+/// `pass_all` is the drag: the pointer has to be able to leave the pill.
+pub fn sync_input_shape(rects: &[[f64; 4]], pass_all: bool) {
     let Some((conn, screen)) = connect() else { return };
     let root = conn.setup().roots[screen].root;
-    let Some(window) = notch_window(&conn, root) else { return };
+    let Some(window) = notch_window(&conn, root) else {
+        static MISSING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if MISSING
+            .compare_exchange(false, true, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed)
+            .is_ok()
+        {
+            crate::applog("linux input shape: notch window not in the client list yet");
+        }
+        return;
+    };
     let Some(geom) = conn.get_geometry(window).ok().and_then(|c| c.reply().ok()) else { return };
-    let rectangles = input_rects(rects, edge, geom.width, geom.height);
+    let rectangles = if pass_all || rects.is_empty() {
+        vec![x11rb::protocol::xproto::Rectangle {
+            x: 0,
+            y: 0,
+            width: geom.width,
+            height: geom.height,
+        }]
+    } else {
+        input_rects(rects)
+    };
     use x11rb::protocol::shape::{ConnectionExt as _, SK, SO};
     use x11rb::protocol::xproto::ClipOrdering;
-    let targets = child_windows(&conn, window);
+    let mut targets = vec![window];
+    descendants(&conn, window, 4, &mut targets);
     let mut failed = false;
-    for target in std::iter::once(window).chain(targets) {
-        match conn.shape_rectangles(SO::SET, SK::INPUT, ClipOrdering::UNSORTED, target, 0, 0, &rectangles) {
+    for target in &targets {
+        match conn.shape_rectangles(SO::SET, SK::INPUT, ClipOrdering::UNSORTED, *target, 0, 0, &rectangles) {
             Ok(cookie) => {
                 if cookie.check().is_err() {
                     failed = true;
@@ -92,73 +109,55 @@ pub fn sync_input_shape(rects: &[[f64; 4]], edge: &str) {
         }
     }
     let _ = conn.flush();
-    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if LOGGED
-        .compare_exchange(false, true, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed)
-        .is_ok()
-    {
+    static LAST: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+    let signature = format!("{window}:{}:{pass_all}:{failed}:{}", rectangles.len(), geom.width);
+    let mut last = LAST.lock().unwrap();
+    if *last != signature {
+        *last = signature;
         crate::applog(&format!(
-            "linux input shape: window={window} size={}x{} strip_edge={edge} rects={} failed={failed}",
+            "linux input shape: window={window} size={}x{} targets={} rects={} pass_all={pass_all} failed={failed}",
             geom.width,
             geom.height,
+            targets.len(),
             rectangles.len()
         ));
     }
 }
 
-fn input_rects(rects: &[[f64; 4]], edge: &str, width: u16, height: u16) -> Vec<x11rb::protocol::xproto::Rectangle> {
+fn input_rects(rects: &[[f64; 4]]) -> Vec<x11rb::protocol::xproto::Rectangle> {
     use x11rb::protocol::xproto::Rectangle;
-    const STRIP: u16 = 140;
+    const PAD: f64 = 16.0;
     let mut out = Vec::new();
-    if width > 0 && height > 0 {
-        match edge {
-            "left" => out.push(Rectangle { x: 0, y: 0, width: STRIP.min(width), height }),
-            "top" => out.push(Rectangle { x: 0, y: 0, width, height: STRIP.min(height) }),
-            "bottom" => {
-                let sh = STRIP.min(height);
-                out.push(Rectangle { x: 0, y: height as i16 - sh as i16, width, height: sh });
-            }
-            _ => {
-                let sw = STRIP.min(width);
-                out.push(Rectangle { x: width as i16 - sw as i16, y: 0, width: sw, height });
-            }
-        }
-    }
     for r in rects {
         if r[2] < 1.0 || r[3] < 1.0 {
             continue;
         }
-        let x = (r[0] - 12.0).floor() as i16;
-        let y = (r[1] - 12.0).floor() as i16;
-        let w = (r[2] + 24.0).ceil().clamp(1.0, 4000.0) as u16;
-        let h = (r[3] + 24.0).ceil().clamp(1.0, 4000.0) as u16;
+        let x = (r[0] - PAD).floor() as i16;
+        let y = (r[1] - PAD).floor() as i16;
+        let w = (r[2] + PAD * 2.0).ceil().clamp(1.0, 4000.0) as u16;
+        let h = (r[3] + PAD * 2.0).ceil().clamp(1.0, 4000.0) as u16;
         out.push(Rectangle { x, y, width: w, height: h });
     }
     out
 }
 
 fn notch_window(conn: &x11rb::rust_connection::RustConnection, root: u32) -> Option<u32> {
-    let list = atom(conn, b"_NET_CLIENT_LIST")?;
-    let prop = conn.get_property(false, root, list, AtomEnum::WINDOW, 0, 256).ok()?.reply().ok()?;
-    let pid = std::process::id();
-    let net_pid = atom(conn, b"_NET_WM_PID");
-    let mut best: Option<(u32, u32)> = None;
-    for window in prop.value32()? {
-        if let Some(pid_atom) = net_pid {
-            if property_u32(conn, window, pid_atom, AtomEnum::CARDINAL) != Some(pid) {
-                continue;
-            }
-        }
-        let Some(geom) = conn.get_geometry(window).ok().and_then(|c| c.reply().ok()) else { continue };
-        let area = geom.width as u32 * geom.height as u32;
-        if area < 8_000 {
-            continue;
-        }
-        if best.map(|(_, known)| area > known).unwrap_or(true) {
-            best = Some((window, area));
+    client_ids(conn, root).into_iter().find(|id| {
+        let (title, _) = window_names(conn, *id);
+        title.contains("Codenotch notch")
+    })
+}
+
+fn descendants(conn: &x11rb::rust_connection::RustConnection, window: u32, depth: u8, out: &mut Vec<u32>) {
+    if depth == 0 {
+        return;
+    }
+    for child in child_windows(conn, window) {
+        if !out.contains(&child) {
+            out.push(child);
+            descendants(conn, child, depth - 1, out);
         }
     }
-    best.map(|(window, _)| window)
 }
 
 fn child_windows(conn: &x11rb::rust_connection::RustConnection, window: u32) -> Vec<u32> {
