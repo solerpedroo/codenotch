@@ -43,7 +43,7 @@ use tauri::{AppHandle, Emitter, Manager};
 /// and its tail on the left. `fitZoom` in ui/notch.html divides by the same width.
 pub const NOTCH_W: f64 = 360.0;
 /// Hand-bumped build tag, written to run.log at startup so a log can always be matched to the exe that wrote it.
-pub const BUILD: &str = "r41";
+pub const BUILD: &str = "r42";
 /// The notch window's long side: the upright window's height, and both sides of the flat one.
 ///
 /// Five cells make a 447 px pill; its fillets add 38.7 px at each end and the settings orb reaches
@@ -331,10 +331,14 @@ pub fn place_notch(app: &AppHandle) {
         zoom_notch(&w, ms, size);
         // Position from the window's measured physical size — deriving it from the scale factor
         // pushed the window past the right edge at 125 % / 150 % (the ring's right side was clipped).
-        let (ww, wh) = w
-            .outer_size()
-            .map(|s| (s.width as i32, s.height as i32))
-            .unwrap_or((target.width as i32, target.height as i32));
+        let measured = w.outer_size().map(|s| (s.width as i32, s.height as i32)).unwrap_or((0, 0));
+        // A zero size shifts a top or left edge by half the real window (run.log pos=3281
+        // with size 0x0, while the window then sat at 3021).
+        let (ww, wh) = if measured.0 > 0 && measured.1 > 0 {
+            measured
+        } else {
+            (target.width as i32, target.height as i32)
+        };
         let ratio = {
             let st = app.state::<AppState>();
             let c = st.cfg.lock().unwrap();
@@ -361,7 +365,11 @@ pub fn place_notch(app: &AppHandle) {
         // overwritten (#240) — place_notch runs after every drag as well as at startup, and a
         // truncating write wiped the rest of the session's diagnostic trail on every drag.
         applog(&format!(
-            "notch placed build={BUILD}: edge={edge} pos=({x},{y}) size=({ww}x{wh}) inner={:?} win_scale={scale} mon_scale={ms} notch_size={size} monitor={:?}=({},{} {}x{}) work={:?} card_insets_css={insets:?}",
+            "notch placed build={BUILD}: edge={edge} pos=({},{}) size=({}x{}) inner={:?} win_scale={scale} mon_scale={ms} notch_size={size} monitor={:?}=({},{} {}x{}) work={:?} card_insets_css={insets:?}",
+            placed.0,
+            placed.1,
+            placed.2,
+            placed.3,
             w.inner_size().map(|s| (s.width, s.height)).unwrap_or((0, 0)),
             mon.name,
             mon.x,
@@ -652,7 +660,9 @@ static EXPANDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::
 
 #[tauri::command]
 fn set_hot(rects: Vec<[f64; 4]>, expanded: bool, probe: Option<[f64; 4]>) {
-    *HOT.lock().unwrap() = rects;
+    *HOT.lock().unwrap() = rects.clone();
+    #[cfg(unix)]
+    crate::x11_util::sync_input_shape(&rects, DRAGGING.load(std::sync::atomic::Ordering::SeqCst));
     backdrop::set_probe(probe);
     EXPANDED.store(expanded, std::sync::atomic::Ordering::Relaxed);
     if expanded {
@@ -845,6 +855,20 @@ fn start_pointer_watchdog(app: AppHandle) {
         loop {
             std::thread::sleep(std::time::Duration::from_millis(WATCHDOG_MS));
             let Some(w) = app.get_webview_window("notch") else { continue };
+            // Linux hit-testing with the root pointer locked the notch shut: the sample sat at
+            // (25,181) while the pill was at y=0, click-through stayed on, and the page never
+            // saw the hover (run.log r41). The input shape is in window coordinates, on the
+            // notch window only, so the pill receives the pointer and the rest does not.
+            #[cfg(unix)]
+            {
+                let rects = HOT.lock().unwrap().clone();
+                let dragging = DRAGGING.load(std::sync::atomic::Ordering::SeqCst);
+                if !dragging {
+                    let _ = w.set_ignore_cursor_events(false);
+                }
+                crate::x11_util::sync_input_shape(&rects, dragging);
+                continue;
+            }
             // A drag follows the pointer off the pill. Turning click-through back on mid-drag
             // drops the button release, so the loop waits until the carry ends.
             if DRAGGING.load(std::sync::atomic::Ordering::SeqCst) {
