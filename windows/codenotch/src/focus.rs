@@ -121,6 +121,11 @@ pub fn focus_terminal(claude_pid: u32) -> bool {
     }
     let maps = proc_maps();
     let chain = chain_of(claude_pid, &maps.ppid);
+    if crate::x11_util::client_windows().into_iter().any(|w| {
+        pid_hits_chain(w.pid, &chain, &maps) && crate::x11_util::activate_window(w.id)
+    }) {
+        return true;
+    }
     let out = run_quiet("wmctrl", &["-l", "-p"]);
     for line in out.lines() {
         let mut parts = line.split_whitespace();
@@ -304,6 +309,12 @@ pub fn focus_claude_desktop() -> bool {
 
 #[cfg(not(windows))]
 pub fn focus_claude_desktop() -> bool {
+    if crate::x11_util::client_windows().into_iter().any(|w| {
+        let blob = format!("{} {}", w.title, w.class_name).to_lowercase();
+        blob.contains("claude") && !blob.contains("codenotch") && crate::x11_util::activate_window(w.id)
+    }) {
+        return true;
+    }
     let out = run_quiet("wmctrl", &["-l", "-p"]);
     for line in out.lines() {
         let lower = line.to_lowercase();
