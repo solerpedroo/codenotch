@@ -6,6 +6,8 @@ mod config;
 mod doctor;
 mod focus;
 mod hooks_install;
+#[cfg(unix)]
+mod x11_util;
 mod i18n;
 mod notchmenu;
 mod server;
@@ -441,7 +443,11 @@ fn left_button_down() -> bool {
     use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
     unsafe { (GetAsyncKeyState(VK_LBUTTON.0 as i32) as u16 & 0x8000) != 0 }
 }
-#[cfg(not(windows))]
+#[cfg(all(not(windows), unix))]
+fn left_button_down() -> bool {
+    crate::x11_util::primary_button_down()
+}
+#[cfg(all(not(windows), not(unix)))]
 fn left_button_down() -> bool {
     false
 }
@@ -1686,8 +1692,31 @@ fn ack_scan(app: &AppHandle) -> bool {
     })
 }
 #[cfg(not(windows))]
-fn ack_scan(_app: &AppHandle) -> bool {
-    false
+fn ack_scan(app: &AppHandle) -> bool {
+    let need = {
+        let st = app.state::<AppState>();
+        let store = st.store.lock().unwrap();
+        store.has_done()
+    };
+    if !need {
+        return false;
+    }
+    let fg = focus::fg_pid();
+    if fg == 0 {
+        return false;
+    }
+    let maps = focus::proc_maps();
+    let fg_name = maps.name.get(&fg).cloned().unwrap_or_default();
+    let fg_is_claude_desktop = fg_name.contains("claude") && !fg_name.contains("codenotch");
+    let st = app.state::<AppState>();
+    let mut store = st.store.lock().unwrap();
+    store.ack_done(|s| {
+        if s.ppid == 0 {
+            fg_is_claude_desktop
+        } else {
+            focus::pid_hits_chain(fg, &focus::chain_of(s.ppid, &maps.ppid), &maps)
+        }
+    })
 }
 
 // ---------------- main ----------------
